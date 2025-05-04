@@ -153,7 +153,7 @@ def load_processed_files(log_file_path):
 
 def filter_videos_parallel(root_dir, log_file_path=".processed_videos.log", max_workers=None):
     """
-    Filters videos in parallel using ThreadPoolExecutor, supporting resume.
+    Filters videos in parallel using ThreadPoolExecutor, supporting resume and progress display.
     """
     if max_workers is None:
         max_workers = min(os.cpu_count() * 2, 16)
@@ -176,9 +176,11 @@ def filter_videos_parallel(root_dir, log_file_path=".processed_videos.log", max_
                 total_files_found += 1
                 absolute_path = os.path.abspath(os.path.join(dirpath, file))
                 if absolute_path not in processed_files_set:
-                    video_paths_to_process.append(absolute_path) # Use absolute path directly
+                    video_paths_to_process.append(absolute_path)
 
     skipped_count = total_files_found - len(video_paths_to_process)
+    total_to_process_this_run = len(video_paths_to_process) # Get total for progress %
+
     print(f"Found {total_files_found} total MP4 files.")
     if skipped_count > 0:
         print(f"Skipping {skipped_count} files already processed (found in log).")
@@ -187,14 +189,15 @@ def filter_videos_parallel(root_dir, log_file_path=".processed_videos.log", max_
         print("No new videos to process.")
         return
 
-    print(f"Processing {len(video_paths_to_process)} new files...")
+    print(f"Processing {total_to_process_this_run} new files...")
 
     # 3. Use ThreadPoolExecutor
     results = {"kept": 0, "removed": 0, "error": 0}
-    log_lock = threading.Lock() # Create a lock for log file writing
+    log_lock = threading.Lock()
+    completed_count = 0 # <-- Initialize progress counter
+    progress_update_interval = 50 # <-- How often to update the progress line
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit tasks with necessary arguments
         future_to_path = {
             executor.submit(process_video, path, log_file_path, log_lock): path
             for path in video_paths_to_process
@@ -202,20 +205,29 @@ def filter_videos_parallel(root_dir, log_file_path=".processed_videos.log", max_
 
         try:
             for future in concurrent.futures.as_completed(future_to_path):
-                original_path = future_to_path[future] # Get original path for context if needed
+                original_path = future_to_path[future]
                 try:
-                    # Result is a tuple: (status_string, absolute_path)
                     status, _ = future.result()
                     if status in results:
                         results[status] += 1
-                    else: # Should not happen
+                    else:
                         print(f"⚠️ Unknown status '{status}' received for {os.path.basename(original_path)}", file=sys.stderr)
                         results["error"] += 1
+
+                    # --- Progress Update Logic ---
+                    completed_count += 1
+                    # Update progress every N files or on the very last file
+                    if completed_count % progress_update_interval == 0 or completed_count == total_to_process_this_run:
+                        percent = (completed_count / total_to_process_this_run) * 100
+                        # Use \r to return to beginning of line, pad with spaces to clear previous longer messages
+                        progress_line = f"\rProgress: {completed_count} / {total_to_process_this_run} ({percent:.1f}%) completed. "
+                        print(progress_line, end='', flush=True) # end='' prevents newline, flush forces output
+
                 except Exception as exc:
-                    # Catch exceptions raised *during* future.result() if worker failed unexpectedly
-                    print(f"❌ Exception for {os.path.basename(original_path)} during result retrieval: {exc}", file=sys.stderr)
+                    print(f"\n❌ Exception for {os.path.basename(original_path)} during result retrieval: {exc}", file=sys.stderr)
                     results["error"] += 1
-                    # Also log this path as processed to avoid retrying infinitely if it always fails
+                    completed_count += 1 # Still count this as completed for progress %
+                     # Also log this path as processed
                     try:
                         with log_lock:
                             with open(log_file_path, 'a', encoding='utf-8') as log_f:
@@ -225,30 +237,28 @@ def filter_videos_parallel(root_dir, log_file_path=".processed_videos.log", max_
 
         except KeyboardInterrupt:
              print("\n🛑 User interrupted. Shutting down workers...")
-             # Allow executor context manager to handle shutdown.
-             # Progress up to this point should be saved in the log file.
              sys.exit(1)
 
+    # --- Final Cleanup ---
+    print() # Print a newline to move cursor off the progress line before the summary
 
     end_time = time.time()
     print("\n--- Filtering Complete ---")
-    print(f"Files processed in this run: {len(video_paths_to_process)}")
+    print(f"Files processed in this run: {total_to_process_this_run}")
     print(f"  Kept:     {results['kept']}")
     print(f"  Removed:  {results['removed']}")
-    print(f"  Errors:   {results['error']}") # Files that failed probe/processing/removal
+    print(f"  Errors:   {results['error']}")
     print(f"Total files skipped (already processed): {skipped_count}")
     print(f"Total time for this run: {end_time - start_time:.2f} seconds")
 
 
 if __name__ == "__main__":
     target_directory = "./train/train/"
-    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".processed_videos.log") # Place log in script dir
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_file = os.path.join(script_dir, ".processed_videos.log")
 
     if not os.path.isdir(target_directory):
         print(f"❌ Error: Target directory not found: {target_directory}", file=sys.stderr)
         sys.exit(1)
 
-    # You can optionally pass a number of workers:
-    # num_workers = 8
-    # filter_videos_parallel(target_directory, log_file_path=log_file, max_workers=num_workers)
     filter_videos_parallel(target_directory, log_file_path=log_file)
