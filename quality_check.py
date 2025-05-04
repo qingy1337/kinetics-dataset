@@ -2,25 +2,37 @@ import os
 import subprocess
 import json
 from fractions import Fraction
-import sys # Added for printing to stderr
+import sys
+import concurrent.futures
+import time
+import threading # Added for locking the log file
 
+# --- (get_video_info function remains the same as the robust version) ---
 def get_video_info(video_path):
+    # Reuse the robust get_video_info function from the previous version
     cmd = [
         "ffprobe", "-v", "error", "-show_entries",
-        "format=duration:stream=codec_type,r_frame_rate", # Ensure we request codec_type too
+        "format=duration:stream=codec_type,r_frame_rate",
         "-of", "json", "-i", video_path
     ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Increased timeout slightly, can be adjusted
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=45, check=False) # check=False to handle errors manually
+    except subprocess.TimeoutExpired:
+        print(f"⏰ Probe timed out: {os.path.basename(video_path)}", file=sys.stderr)
+        return None # Indicate error
 
     if result.returncode != 0:
-        print(f"❌ Error probing {video_path}: {result.stderr.strip()}", file=sys.stderr)
-        return None
+        error_msg = result.stderr.strip()
+        print(f"❌ Probe error ({result.returncode}): {os.path.basename(video_path)} - {error_msg}", file=sys.stderr)
+        return None # Indicate error
 
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        print(f"❌ Error decoding JSON for {video_path}: {result.stdout}", file=sys.stderr)
-        return None
+        print(f"❌ JSON decode error: {os.path.basename(video_path)}", file=sys.stderr)
+        return None # Indicate error
 
     # --- Safely get duration ---
     duration = None
@@ -28,105 +40,215 @@ def get_video_info(video_path):
         try:
             duration = float(data["format"]["duration"])
         except (ValueError, TypeError):
-            print(f"⚠️ Warning: Invalid duration format for {video_path}", file=sys.stderr)
-            return None # Cannot proceed without duration
+            # Log error but return None as it's critical info
+            print(f"⚠️ Invalid duration format: {os.path.basename(video_path)}", file=sys.stderr)
+            return None
     else:
-        print(f"⚠️ Warning: Could not find duration for {video_path}", file=sys.stderr)
-        return None # Cannot proceed without duration
+        # Log error but return None as it's critical info
+        print(f"⚠️ No duration found: {os.path.basename(video_path)}", file=sys.stderr)
+        return None
 
-    # --- Safely get FPS from the first valid video stream ---
+    # --- Safely get FPS ---
     fps = None
     if "streams" in data:
         for stream in data["streams"]:
-            # Check if it's a video stream AND has frame rate info
             if stream.get("codec_type") == "video" and "r_frame_rate" in stream:
                 fps_str = stream["r_frame_rate"]
-                # Check for valid frame rate string (not "0/0" or empty)
                 if fps_str and fps_str != "0/0":
                     try:
-                        # Use Fraction for accurate FPS calculation
                         fps = float(Fraction(*map(int, fps_str.split("/"))))
-                        # Found valid FPS, stop searching streams
-                        break
+                        break # Found valid FPS
                     except (ValueError, ZeroDivisionError, TypeError):
-                        print(f"⚠️ Warning: Invalid r_frame_rate format '{fps_str}' in {video_path}", file=sys.stderr)
-                        # Continue searching other streams if any
+                         print(f"⚠️ Invalid FPS format '{fps_str}': {os.path.basename(video_path)}", file=sys.stderr)
                 else:
-                     print(f"⚠️ Warning: Found video stream but invalid r_frame_rate '{fps_str}' in {video_path}", file=sys.stderr)
-                     # Continue searching other streams if any
+                     print(f"⚠️ Invalid FPS value '{fps_str}': {os.path.basename(video_path)}", file=sys.stderr)
 
+    # --- Return results only if both duration and FPS are valid ---
     if duration is not None and fps is not None:
         return {
             "duration": duration,
             "fps": fps
         }
-    elif duration is not None:
-         print(f"⚠️ Warning: Found duration but no valid FPS for {video_path}", file=sys.stderr)
+    elif duration is not None: # Duration found, but FPS wasn't
+         print(f"⚠️ No valid FPS found (duration was {duration:.2f}s): {os.path.basename(video_path)}", file=sys.stderr)
+         # Return None because FPS is required for filtering
+         return None
+    else: # Should be covered by earlier checks, but safety first
+        return None
+# --- (End of get_video_info) ---
 
-    # If no valid video stream with FPS was found or duration was missing
-    return None
 
-def filter_videos(root_dir):
-    print(f"--- Starting video filtering in {root_dir} ---")
-    processed_count = 0
-    removed_count = 0
-    valid_count = 0
+def process_video(video_path, log_file_path, log_lock):
+    """
+    Worker function to process a single video file.
+    Checks criteria, removes if needed, and logs the processed path.
+    Returns: Tuple (status_string, video_path) e.g. ("kept", "/path/to/vid.mp4")
+             status_string can be "kept", "removed", "error"
+    """
+    absolute_path = os.path.abspath(video_path)
+    base_name = os.path.basename(video_path)
+    status = "error" # Default status
 
+    try:
+        info = get_video_info(video_path)
+
+        if not info:
+            print(f"🚫 Skipping (probe error/missing info): {base_name}")
+            status = "error"
+            # Even if there's an error, we log it as processed to avoid retrying
+        else:
+            duration, fps = info["duration"], info["fps"]
+            remove_reason = None
+            if duration < 9.5 or duration > 10.5:
+                remove_reason = f"Duration {duration:.2f}s"
+            elif fps < 30:
+                remove_reason = f"FPS {fps:.2f}"
+
+            if remove_reason:
+                try:
+                    os.remove(video_path)
+                    print(f"🗑️ Removed ({remove_reason}): {base_name}")
+                    status = "removed"
+                except OSError as e:
+                    print(f"❌ Error removing {base_name}: {e}", file=sys.stderr)
+                    status = "error" # Failed to remove, count as error
+            else:
+                # Keep print concise for valid files during parallel runs
+                # print(f"✅ Kept ({duration:.2f}s, {fps:.2f} FPS): {base_name}")
+                status = "kept"
+
+    except subprocess.TimeoutExpired:
+        print(f"⏰ Timeout processing: {base_name}", file=sys.stderr)
+        status = "error" # Log timeout as an error state for this run
+    except Exception as e:
+        print(f"❌ Unexpected error processing {base_name}: {e}", file=sys.stderr)
+        status = "error"
+
+    # --- Log regardless of status to prevent reprocessing ---
+    try:
+        with log_lock: # Ensure only one thread writes at a time
+            with open(log_file_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(absolute_path + '\n')
+    except IOError as e:
+         print(f"❌ CRITICAL: Failed to write to log file {log_file_path}: {e}", file=sys.stderr)
+         # Decide how to handle this - maybe stop the script?
+         # For now, the worker will still return its status
+
+    return status, absolute_path # Return status and path
+
+
+def load_processed_files(log_file_path):
+    """Loads processed file paths from the log file into a set."""
+    processed = set()
+    if os.path.exists(log_file_path):
+        try:
+            with open(log_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    processed.add(line.strip())
+        except IOError as e:
+             print(f"⚠️ Warning: Could not read log file {log_file_path}: {e}", file=sys.stderr)
+             # Continue with an empty set, processing might repeat
+    return processed
+
+
+def filter_videos_parallel(root_dir, log_file_path=".processed_videos.log", max_workers=None):
+    """
+    Filters videos in parallel using ThreadPoolExecutor, supporting resume.
+    """
+    if max_workers is None:
+        max_workers = min(os.cpu_count() * 2, 16)
+
+    print(f"--- Starting resumable parallel video filtering in {root_dir} ---")
+    print(f"Using log file: {log_file_path}")
+    print(f"Max workers: {max_workers}")
+    start_time = time.time()
+
+    # 1. Load already processed files
+    processed_files_set = load_processed_files(log_file_path)
+    print(f"Loaded {len(processed_files_set)} paths from log file.")
+
+    # 2. Collect video file paths *not* in the processed set
+    video_paths_to_process = []
+    total_files_found = 0
     for dirpath, _, files in os.walk(root_dir):
         for file in files:
-            # Process only .mp4 files
             if file.lower().endswith(".mp4"):
-                processed_count += 1
-                video_path = os.path.join(dirpath, file)
-                print(f"🔍 Analyzing [{processed_count}]: {video_path}")
+                total_files_found += 1
+                absolute_path = os.path.abspath(os.path.join(dirpath, file))
+                if absolute_path not in processed_files_set:
+                    video_paths_to_process.append(absolute_path) # Use absolute path directly
 
-                info = get_video_info(video_path)
+    skipped_count = total_files_found - len(video_paths_to_process)
+    print(f"Found {total_files_found} total MP4 files.")
+    if skipped_count > 0:
+        print(f"Skipping {skipped_count} files already processed (found in log).")
 
-                # If ffprobe failed or couldn't extract necessary info
-                if not info:
-                    print(f"🚫 Skipping due to probe error or missing info: {os.path.basename(video_path)}")
-                    # Decide if you want to REMOVE files that ffprobe fails on
-                    # Uncomment below to remove them:
-                    # try:
-                    #     os.remove(video_path)
-                    #     print(f"🗑️ Removed due to probe error: {os.path.basename(video_path)}")
-                    #     removed_count += 1
-                    # except OSError as e:
-                    #     print(f"❌ Error removing {video_path}: {e}", file=sys.stderr)
-                    continue # Skip to the next file
+    if not video_paths_to_process:
+        print("No new videos to process.")
+        return
 
-                duration, fps = info["duration"], info["fps"]
+    print(f"Processing {len(video_paths_to_process)} new files...")
 
-                # --- Apply Filters ---
-                remove_reason = None
-                if duration < 9.5 or duration > 10.5:
-                    remove_reason = f"Duration mismatch ({duration:.2f}s ≠ 10s ± 0.5s)"
-                elif fps < 29:
-                   remove_reason = f"FPS too low ({fps:.2f} < 29)"
+    # 3. Use ThreadPoolExecutor
+    results = {"kept": 0, "removed": 0, "error": 0}
+    log_lock = threading.Lock() # Create a lock for log file writing
 
-                # --- Perform Action ---
-                if remove_reason:
-                    print(f"      Reason: {remove_reason}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit tasks with necessary arguments
+        future_to_path = {
+            executor.submit(process_video, path, log_file_path, log_lock): path
+            for path in video_paths_to_process
+        }
+
+        try:
+            for future in concurrent.futures.as_completed(future_to_path):
+                original_path = future_to_path[future] # Get original path for context if needed
+                try:
+                    # Result is a tuple: (status_string, absolute_path)
+                    status, _ = future.result()
+                    if status in results:
+                        results[status] += 1
+                    else: # Should not happen
+                        print(f"⚠️ Unknown status '{status}' received for {os.path.basename(original_path)}", file=sys.stderr)
+                        results["error"] += 1
+                except Exception as exc:
+                    # Catch exceptions raised *during* future.result() if worker failed unexpectedly
+                    print(f"❌ Exception for {os.path.basename(original_path)} during result retrieval: {exc}", file=sys.stderr)
+                    results["error"] += 1
+                    # Also log this path as processed to avoid retrying infinitely if it always fails
                     try:
-                        os.remove(video_path)
-                        print(f"🗑️ Removed: {os.path.basename(video_path)}")
-                        removed_count += 1
-                    except OSError as e:
-                         print(f"❌ Error removing {video_path}: {e}", file=sys.stderr)
-                else:
-                    print(f"✅ Keeping ({duration:.2f}s, {fps:.2f} FPS): {os.path.basename(video_path)}")
-                    valid_count += 1
+                        with log_lock:
+                            with open(log_file_path, 'a', encoding='utf-8') as log_f:
+                                log_f.write(os.path.abspath(original_path) + '\n')
+                    except IOError as e:
+                         print(f"❌ CRITICAL: Failed to write to log file after exception for {original_path}: {e}", file=sys.stderr)
 
+        except KeyboardInterrupt:
+             print("\n🛑 User interrupted. Shutting down workers...")
+             # Allow executor context manager to handle shutdown.
+             # Progress up to this point should be saved in the log file.
+             sys.exit(1)
+
+
+    end_time = time.time()
     print("\n--- Filtering Complete ---")
-    print(f"Total files processed: {processed_count}")
-    print(f"Files kept: {valid_count}")
-    print(f"Files removed: {removed_count}")
-    print(f"Files skipped due to errors: {processed_count - valid_count - removed_count}")
+    print(f"Files processed in this run: {len(video_paths_to_process)}")
+    print(f"  Kept:     {results['kept']}")
+    print(f"  Removed:  {results['removed']}")
+    print(f"  Errors:   {results['error']}") # Files that failed probe/processing/removal
+    print(f"Total files skipped (already processed): {skipped_count}")
+    print(f"Total time for this run: {end_time - start_time:.2f} seconds")
 
 
 if __name__ == "__main__":
     target_directory = "./train/train/"
+    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".processed_videos.log") # Place log in script dir
+
     if not os.path.isdir(target_directory):
         print(f"❌ Error: Target directory not found: {target_directory}", file=sys.stderr)
-        sys.exit(1) # Exit with an error code
-    filter_videos(target_directory)
+        sys.exit(1)
+
+    # You can optionally pass a number of workers:
+    # num_workers = 8
+    # filter_videos_parallel(target_directory, log_file_path=log_file, max_workers=num_workers)
+    filter_videos_parallel(target_directory, log_file_path=log_file)
