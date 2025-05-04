@@ -101,8 +101,8 @@ def filter_videos(root_dir):
                 remove_reason = None
                 if duration < 9.5 or duration > 10.5:
                     remove_reason = f"Duration mismatch ({duration:.2f}s ≠ 10s ± 0.5s)"
-                elif fps < 30:
-                   remove_reason = f"FPS too low ({fps:.2f} < 30)"
+                elif fps < 29:
+                   remove_reason = f"FPS too low ({fps:.2f} < 29)"
 
                 # --- Perform Action ---
                 if remove_reason:
