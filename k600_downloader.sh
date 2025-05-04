@@ -1,46 +1,46 @@
 #!/bin/bash
+set -euo pipefail
 
-# Download directories vars
+# Root download directories
 root_dl="k600"
 root_dl_targz="k600_targz"
 
-# Make root directories
-[ ! -d $root_dl ] && mkdir $root_dl
-[ ! -d $root_dl_targz ] && mkdir $root_dl_targz
+# Create directories if missing
+mkdir -p "$root_dl" "$root_dl_targz"
 
-# Download train tars, will resume
-curr_dl=${root_dl_targz}/train
-url=https://s3.amazonaws.com/kinetics/600/train/k600_train_path.txt
-[ ! -d $curr_dl ] && mkdir -p $curr_dl
-wget -c -i $url -P $curr_dl
+# aria2 options: continue, 16 splits, 16 connections/server, 4 parallel downloads
+ARIA2_OPTS="-c -s16 -x16 -j4 --input-file"
 
-# Download validation tars, will resume
-curr_dl=${root_dl_targz}/val
-url=https://s3.amazonaws.com/kinetics/600/val/k600_val_path.txt
-[ ! -d $curr_dl ] && mkdir -p $curr_dl
-wget -c -i $url -P $curr_dl
+# Function to fetch URL lists and download via aria2
+download_batch() {
+  local list_url=$1
+  local out_dir=$2
 
-# Download test tars, will resume
-curr_dl=${root_dl_targz}/test
-url=https://s3.amazonaws.com/kinetics/600/test/k600_test_path.txt
-[ ! -d $curr_dl ] && mkdir -p $curr_dl
-wget -c -i $url -P $curr_dl
+  # Prepare output directory
+  mkdir -p "$out_dir"
 
-# Download annotations csv files
-curr_dl=${root_dl}/annotations
-url_tr=https://s3.amazonaws.com/kinetics/600/annotations/train.txt
-url_v=https://s3.amazonaws.com/kinetics/600/annotations/val.txt
-url_t=https://s3.amazonaws.com/kinetics/600/annotations/test.csv
-url_ht=https://s3.amazonaws.com/kinetics/600/annotations/kinetics600_holdout_test.csv
-[ ! -d $curr_dl ] && mkdir -p $curr_dl
-wget -c $url_tr -P $curr_dl
-wget -c $url_v -P $curr_dl
-wget -c $url_t -P $curr_dl
-wget -c $url_ht -P $curr_dl
+  # Fetch URL list
+  curl -sSL "$list_url" -o "${out_dir}/urls.txt"  # uses curl for simplicity
 
-# Download readme
-url=http://s3.amazonaws.com/kinetics/600/readme.md
-wget -c $url -P $root_dl
+  # Invoke aria2
+  aria2c $ARIA2_OPTS "${out_dir}/urls.txt" -d "$out_dir"
+}
 
-# Downloads complete
+# Download train, val, test tarballs
+download_batch "https://s3.amazonaws.com/kinetics/600/train/k600_train_path.txt" "$root_dl_targz/train"
+download_batch "https://s3.amazonaws.com/kinetics/600/val/k600_val_path.txt"   "$root_dl_targz/val"
+download_batch "https://s3.amazonaws.com/kinetics/600/test/k600_test_path.txt" "$root_dl_targz/test"
+
+# Download annotation files individually (small files)
+mkdir -p "$root_dl/annotations"
+aria2c -c \
+       https://s3.amazonaws.com/kinetics/600/annotations/train.txt \
+       https://s3.amazonaws.com/kinetics/600/annotations/val.txt \
+       https://s3.amazonaws.com/kinetics/600/annotations/test.csv \
+       https://s3.amazonaws.com/kinetics/600/annotations/kinetics600_holdout_test.csv \
+       -d "$root_dl/annotations"
+
+# Download README
+aria2c -c https://s3.amazonaws.com/kinetics/600/readme.md -d "$root_dl"
+
 echo -e "\nDownloads complete! Now run extractor, k600_extractor.sh"
