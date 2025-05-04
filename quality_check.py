@@ -101,7 +101,7 @@ def process_video(video_path, log_file_path, log_lock):
             remove_reason = None
             if duration < 9.5 or duration > 10.5:
                 remove_reason = f"Duration {duration:.2f}s"
-            elif fps < 30:
+            elif abs(fps-30) > 1:
                 remove_reason = f"FPS {fps:.2f}"
 
             if remove_reason:
