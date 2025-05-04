@@ -28,6 +28,7 @@ download_batch() {
 
 # Download train, val, test tarballs
 download_batch "https://s3.amazonaws.com/kinetics/600/train/k600_train_path.txt" "$root_dl_targz/train"
+download_batch "https://s3.amazonaws.com/kinetics/600/test/k600_test_path.txt" "$root_dl_targz/test"
 
 # Download annotation files individually (small files)
 mkdir -p "$root_dl/annotations"
