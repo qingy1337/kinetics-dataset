@@ -30,3 +30,10 @@
 /kinetics-dataset > cd k600
 /kinetics-dataset/k600 > python quality_check.py
 ```
+
+### Generate JSON dataset (compatible with IV2 training)
+```
+/kinetics-dataset > mv generate_json_dataset.py ./k600/train/train/
+/kinetics-dataset > cd k600/train/train/
+/kinetics-dataset/k600/train/train > python generate_json_dataset.py # output saved to kinetics.json in /kinetics-dataset/k600/train/train/
+```
