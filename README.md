@@ -23,3 +23,10 @@
 /kinetics-dataset > cd k600
 /kinetics-dataset/k600 > grep -v '^$' removed_actions.txt | tr '\n' '\0' | xargs -0 -I {} rm -rf "./train/train/{}/"
 ```
+
+### Filter only quality videos (~30 fps, ~10 seconds in duration)
+```
+/kinetics-dataset > mv quality_check.py ./k600/
+/kinetics-dataset > cd k600
+/kinetics-dataset/k600 > python quality_check.py
+```
